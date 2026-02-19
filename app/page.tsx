@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { CSVUploader } from "@/components/csv-uploader"
 import { ResultsTable, AnalysisResult } from "@/components/results-table"
 import { Button } from "@/components/ui/button"
@@ -16,13 +16,37 @@ export default function Home() {
     const [isPaused, setIsPaused] = useState(false)
     const [shouldStop, setShouldStop] = useState(false)
 
+    // Gemini Daily Usage
+    const [geminiUsage, setGeminiUsage] = useState(0)
+    const DAILY_LIMIT = 1500
+
+    useEffect(() => {
+        const storedDate = localStorage.getItem('gemini_usage_date')
+        const storedCount = localStorage.getItem('gemini_usage_count')
+        const today = new Date().toDateString()
+
+        if (storedDate !== today) {
+            localStorage.setItem('gemini_usage_date', today)
+            localStorage.setItem('gemini_usage_count', '0')
+            setGeminiUsage(0)
+        } else if (storedCount) {
+            setGeminiUsage(parseInt(storedCount, 10))
+        }
+    }, [])
+
+    const updateGeminiUsage = () => {
+        const newCount = geminiUsage + 1
+        setGeminiUsage(newCount)
+        localStorage.setItem('gemini_usage_count', newCount.toString())
+    }
+
     const handleDataLoaded = (loadedData: any[]) => {
         if (loadedData.length === 0) return;
 
         const allKeys = Object.keys(loadedData[0]);
         console.log("CSV Headers found:", allKeys);
 
-        // PRIORITY 1: Scan the first few rows to find a column whose VALUES contain instagram.com
+        // PRIORITY 1: Scan for column with instagram.com values
         let dataKey: string | undefined = undefined;
         const sampleRows = loadedData.slice(0, Math.min(10, loadedData.length));
         for (const k of allKeys) {
@@ -70,7 +94,6 @@ export default function Home() {
 
         console.log("Using column:", dataKey);
 
-        // Transform loaded data
         const initialData: AnalysisResult[] = [];
         for (const row of loadedData) {
             const rawValue = String((row as any)[dataKey!] || '').trim();
@@ -88,7 +111,6 @@ export default function Home() {
                     if (lastPart && lastPart !== 'instagram.com' && lastPart !== 'www.instagram.com') {
                         username = lastPart;
                     }
-                    // Ensure profileUrl has https:// for clickable links
                     if (rawValue.startsWith('www.')) {
                         profileUrl = `https://${rawValue}`;
                     } else if (!rawValue.startsWith('http')) {
@@ -132,7 +154,7 @@ export default function Home() {
 
     const stopAnalysis = () => {
         setShouldStop(true)
-        setIsProcessing(false) // This might not stop immediately, loop needs to check
+        setIsProcessing(false)
     }
 
     const startAnalysis = async () => {
@@ -142,12 +164,9 @@ export default function Home() {
         setIsPaused(false)
         setProgress({ current: 0, total: data.length })
 
-        // Process one by one to avoid rate limits
         for (let i = 0; i < data.length; i++) {
-            // Check stop/pause conditions
             if (shouldStop) break;
 
-            // Simple pause mechanism: wait while paused
             while (isPaused) {
                 if (shouldStop) break;
                 await new Promise(resolve => setTimeout(resolve, 500));
@@ -159,7 +178,6 @@ export default function Home() {
                 continue
             }
 
-            // Update status to processing
             setData(prev => {
                 const newData = [...prev]
                 newData[i] = { ...newData[i], status: 'processing' }
@@ -169,9 +187,7 @@ export default function Home() {
             try {
                 const response = await fetch('/api/analyze', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ username: item.username }),
                 })
 
@@ -182,7 +198,10 @@ export default function Home() {
 
                 const result = await response.json()
 
-                // Update with result
+                if (result.reason && (result.reason.includes('AI') || result.reason.includes('Gemini'))) {
+                    updateGeminiUsage();
+                }
+
                 setData(prev => {
                     const newData = [...prev]
                     newData[i] = {
@@ -199,21 +218,14 @@ export default function Home() {
                 console.error("Error analyzing", item.username, error)
                 setData(prev => {
                     const newData = [...prev]
-                    newData[i] = {
-                        ...newData[i],
-                        status: 'error',
-                        reason: String(error)
-                    }
+                    newData[i] = { ...newData[i], status: 'error', reason: String(error) }
                     return newData
                 })
             }
 
             setProgress(prev => ({ ...prev, current: i + 1 }))
-
-            // Wait 5 seconds between profiles to respect Gemini's 15 RPM rate limit
             await new Promise(resolve => setTimeout(resolve, 5000))
         }
-
         setIsProcessing(false)
     }
 
@@ -236,7 +248,6 @@ export default function Home() {
             </div>
 
             <div className="grid gap-6 w-full max-w-5xl">
-                {/* Upload Section */}
                 <div className="grid gap-4 md:grid-cols-2">
                     <Card>
                         <CardHeader>
@@ -253,7 +264,22 @@ export default function Home() {
                             <CardTitle>Actions</CardTitle>
                             <CardDescription>Control the analysis process.</CardDescription>
                         </CardHeader>
-                        <CardContent className="flex flex-col gap-4 justify-center h-[200px]"> {/* quick fix for height alignment */}
+                        <CardContent className="flex flex-col gap-4 justify-center">
+
+                            {/* Gemini Usage Bar */}
+                            <div className="flex flex-col gap-2 p-3 bg-zinc-100 dark:bg-zinc-900 rounded-lg border border-zinc-200 dark:border-zinc-800">
+                                <div className="flex justify-between text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                                    <span>AI Usage Credit (Daily)</span>
+                                    <span>{geminiUsage} / {DAILY_LIMIT}</span>
+                                </div>
+                                <div className="h-2 w-full bg-zinc-300 dark:bg-zinc-700 rounded-full overflow-hidden">
+                                    <div
+                                        className={`h-full transition-all duration-500 ease-in-out ${geminiUsage > DAILY_LIMIT * 0.9 ? 'bg-red-500' : 'bg-green-500'}`}
+                                        style={{ width: `${Math.min((geminiUsage / DAILY_LIMIT) * 100, 100)}%` }}
+                                    />
+                                </div>
+                            </div>
+
                             <div className="flex flex-col gap-2">
                                 <div className="flex justify-between text-sm mb-1">
                                     <span>Total Leads: {data.length}</span>
@@ -302,8 +328,6 @@ export default function Home() {
                         </CardContent>
                     </Card>
                 </div>
-
-                {/* Results Table */}
                 <ResultsTable data={data} />
             </div>
         </main>
