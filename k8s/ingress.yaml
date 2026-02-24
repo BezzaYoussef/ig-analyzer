@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ig-analyzer-ingress
+  namespace: default
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - ig-analyzer.duckdns.org   # <-- REPLACE with your actual domain
+      secretName: ig-analyzer-tls
+  rules:
+    - host: ig-analyzer.duckdns.org  # <-- REPLACE with your actual domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ig-analyzer-svc
+                port:
+                  number: 80

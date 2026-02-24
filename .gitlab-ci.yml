@@ -1,0 +1,45 @@
+stages:
+  - build
+  - deploy
+
+variables:
+  IMAGE_TAG: registry.gitlab.com/$CI_PROJECT_PATH:$CI_COMMIT_SHORT_SHA
+  IMAGE_LATEST: registry.gitlab.com/$CI_PROJECT_PATH:latest
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BUILD: Build the Docker image and push to GitLab Container Registry
+# ──────────────────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build
+        --build-arg GEMINI_API_KEY=$GEMINI_API_KEY
+        -t $IMAGE_TAG
+        -t $IMAGE_LATEST .
+    - docker push $IMAGE_TAG
+    - docker push $IMAGE_LATEST
+  only:
+    - main
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DEPLOY: Apply latest image to Kubernetes cluster via kubectl
+# ──────────────────────────────────────────────────────────────────────────────
+deploy:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - kubectl set image deployment/ig-analyzer ig-analyzer=$IMAGE_TAG -n default
+    - kubectl rollout status deployment/ig-analyzer -n default --timeout=120s
+  only:
+    - main
+  needs:
+    - build

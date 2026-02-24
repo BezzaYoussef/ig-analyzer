@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ig-analyzer
+  namespace: default
+  labels:
+    app: ig-analyzer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ig-analyzer
+  template:
+    metadata:
+      labels:
+        app: ig-analyzer
+    spec:
+      containers:
+        - name: ig-analyzer
+          image: registry.gitlab.com/youssefbz124-group/ig-analyzer:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ig-analyzer-secrets
+                  key: GEMINI_API_KEY
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      imagePullSecrets:
+        - name: gitlab-registry-secret
