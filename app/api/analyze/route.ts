@@ -90,10 +90,17 @@ async function detectGenderByImage(imageUrl: string, username: string): Promise<
     return null;
 }
 
-// Extract display name from Instagram page title
+// Extract display name from Instagram page title (format: "Name (@username) • Instagram")
 function extractDisplayName(title: string): string {
     const match = title.match(/^(.+?)\s*\(@/);
     return match?.[1]?.trim() || '';
+}
+
+// Fallback: try to guess first name from the username itself
+// e.g. "erika.schweitzer" → "erika", "john_doe_1990" → "john"
+function extractFirstNameFromUsername(username: string): string {
+    const parts = username.toLowerCase().split(/[._\-0-9]+/).filter(p => p.length >= 2);
+    return parts[0] || '';
 }
 
 export async function POST(req: Request) {
@@ -105,14 +112,27 @@ export async function POST(req: Request) {
 
         console.log(`\n══════ ${username} ══════`);
 
-        const browser = await chromium.launch({ headless: true });
+        const browser = await chromium.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-setuid-sandbox']
+        });
         const context = await browser.newContext({
             userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         });
         const page = await context.newPage();
 
+        // Block images, fonts, and stylesheets — we only need og: meta tags
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+                route.abort();
+            } else {
+                route.continue();
+            }
+        });
+
         try {
-            await page.goto(`https://www.instagram.com/${username}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.goto(`https://www.instagram.com/${username}/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
             const bio = await page.locator('meta[property="og:description"]').getAttribute('content').catch(() => '');
             const image = await page.locator('meta[property="og:image"]').getAttribute('content').catch(() => '');
@@ -159,17 +179,22 @@ export async function POST(req: Request) {
                 console.log(`  → Female (bio)`);
             }
 
-            // ── STEP 3: Local name database (NO API CALLS) ──
-            if (category === 'N/A' && displayName) {
-                console.log(`  🔍 Checking local name database for "${displayName}"...`);
-                const nameResult = detectGenderFromName(displayName);
-                if (nameResult) {
-                    category = nameResult.gender === 'male' ? 'Male' : 'Female';
-                    confidence = nameResult.probability > 0.9 ? 'High' : 'Medium';
-                    reason = `Name "${displayName}" → ${nameResult.gender} (local DB, ${Math.round(nameResult.probability * 100)}%)`;
-                    console.log(`  → ${category} (name: "${displayName}")`);
-                } else {
-                    console.log(`  ✗ Name "${displayName}" not in database`);
+            // ── STEP 3: Local name database — try display name first, then username ──
+            if (category === 'N/A') {
+                // Try display name from page title
+                const namesToTry = [displayName, extractFirstNameFromUsername(username)].filter(Boolean);
+                for (const nameCandidate of namesToTry) {
+                    console.log(`  🔍 Checking local name DB for "${nameCandidate}"...`);
+                    const nameResult = detectGenderFromName(nameCandidate!);
+                    if (nameResult) {
+                        category = nameResult.gender === 'male' ? 'Male' : 'Female';
+                        confidence = nameResult.probability > 0.9 ? 'High' : 'Medium';
+                        reason = `Name "${nameCandidate}" → ${nameResult.gender} (local DB, ${Math.round(nameResult.probability * 100)}%)`;
+                        console.log(`  → ${category} (name: "${nameCandidate}")`);
+                        break;
+                    } else {
+                        console.log(`  ✗ Name "${nameCandidate}" not in database`);
+                    }
                 }
             }
 
