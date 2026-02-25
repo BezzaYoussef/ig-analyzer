@@ -9,11 +9,8 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-
-# GEMINI_API_KEY is injected at build time via CI/CD as a build arg
-ARG GEMINI_API_KEY
-ENV GEMINI_API_KEY=$GEMINI_API_KEY
-
+# Ensure public dir exists even if the project doesn't have one
+RUN mkdir -p /app/public
 RUN npm run build
 
 # Stage 3: Production runner (lean final image)
@@ -21,6 +18,7 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
+# GEMINI_API_KEY is injected at runtime by Render (no need to bake into image)
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/node_modules ./node_modules
