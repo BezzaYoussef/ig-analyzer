@@ -133,24 +133,17 @@ function extractDisplayName(title: string): string {
     return match?.[1]?.trim() || '';
 }
 
-// Fallback: try to guess first name from the username itself
-// Goes longest-to-shortest so "erinbainbridge" finds "erin" before shorter wrong matches
+// Get candidate names from username using separator splits ONLY (no prefix scanning)
+// e.g. erika.schweitzer → ["erika", "schweitzer"]  erikitasnydes → [] (no separators)
 function getCandidateNamesFromUsername(username: string): string[] {
     const lower = username.toLowerCase();
-    const candidates: string[] = [];
-
-    // 1. Split by separators (e.g. erika.schweitzer → ["erika", "schweitzer"])
+    // Only split on explicit separators (dots, underscores, hyphens, digits)
+    // Do NOT do prefix scanning — it causes false positives (e.g. "erik" in "erikitasnydes")
     const parts = lower.split(/[._\-0-9]+/).filter(p => p.length >= 2);
-    candidates.push(...parts);
-
-    // 2. If no separators or first part is the whole name, scan prefixes longest-first
-    const full = parts.length === 1 || parts[0] === lower ? lower : parts[0];
-    for (let len = Math.min(12, full.length); len >= 3; len--) {
-        const prefix = full.slice(0, len);
-        if (!candidates.includes(prefix)) candidates.push(prefix);
-    }
-
-    return candidates;
+    // If the whole username is one solid block (no separators), return empty
+    // and let Gemini handle it
+    if (parts.length === 1 && parts[0] === lower) return [];
+    return parts;
 }
 
 export async function POST(req: Request) {
@@ -248,43 +241,31 @@ export async function POST(req: Request) {
                 }
             }
 
-            // ── STEP 4: Combined Gemini AI — text + image analysis ──
+            // ── STEP 4: Gemini IMAGE first (highest-priority AI signal) ──
             if (category === 'N/A') {
-                console.log(`  🤖 Running Gemini text + image analysis...`);
-
-                // 4a: Text classification (always runs)
-                const textResult = await classifyWithGeminiText(username, displayName, bio || '');
-
-                // 4b: Image classification (runs in parallel intent, but sequentially due to rate limit)
+                console.log(`  📸 Running Gemini image analysis (priority 1)...`);
                 const imageResult = await classifyWithGeminiImage(image || '');
+                if (imageResult) {
+                    category = imageResult.gender === 'male' ? 'Male' : 'Female';
+                    confidence = 'Medium';
+                    reason = imageResult.reason;
+                    console.log(`  → ${category} (image)`);
+                }
+            }
 
-                const textGender = textResult?.gender;
-                const imgGender = imageResult?.gender;
-
-                // Combine results
-                if (textGender && imgGender && textGender === imgGender) {
-                    // Both agree → High confidence
-                    category = textGender === 'male' ? 'Male' : textGender === 'female' ? 'Female' : 'Business Page';
-                    confidence = 'High';
-                    reason = `${textResult!.reason} + ${imageResult!.reason}`;
-                    console.log(`  → ${category} (text + image AGREE → High)`);
-                } else if (textGender && textGender !== 'business') {
-                    // Text only
-                    category = textGender === 'male' ? 'Male' : 'Female';
-                    confidence = 'Medium';
-                    reason = textResult!.reason + (imgGender ? ` (image: ${imgGender})` : ' (no image result)');
-                    console.log(`  → ${category} (text only)`);
-                } else if (imgGender) {
-                    // Image only
-                    category = imgGender === 'male' ? 'Male' : 'Female';
-                    confidence = 'Medium';
-                    reason = imageResult!.reason;
-                    console.log(`  → ${category} (image only)`);
-                } else if (textResult?.gender === 'business') {
-                    category = 'Business Page';
-                    confidence = 'Medium';
-                    reason = textResult.reason;
-                    console.log(`  → Business Page (text)`);
+            // ── STEP 5: Gemini TEXT fallback (when image fails or is unavailable) ──
+            if (category === 'N/A') {
+                console.log(`  🤖 Running Gemini text classification (fallback)...`);
+                const textResult = await classifyWithGeminiText(username, displayName, bio || '');
+                if (textResult) {
+                    if (textResult.gender === 'male') {
+                        category = 'Male'; confidence = 'Medium'; reason = textResult.reason;
+                    } else if (textResult.gender === 'female') {
+                        category = 'Female'; confidence = 'Medium'; reason = textResult.reason;
+                    } else if (textResult.gender === 'business') {
+                        category = 'Business Page'; confidence = 'Medium'; reason = textResult.reason;
+                    }
+                    console.log(`  → ${category} (text)`);
                 }
             }
 
