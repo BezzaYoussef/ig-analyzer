@@ -28,60 +28,54 @@ async function waitForGeminiRateLimit() {
     lastGeminiCallTime = Date.now();
 }
 
-// Use Gemini Vision to analyze profile picture
-async function detectGenderByImage(imageUrl: string, username: string): Promise<{ gender: string; confidence: string; reason: string } | null> {
+// Use Gemini as a TEXT classifier: username + display name + bio
+async function classifyWithGeminiText(
+    username: string,
+    displayName: string,
+    bio: string
+): Promise<{ gender: string; confidence: string; reason: string } | null> {
     if (!GEMINI_API_KEY) {
         console.log(`  ⚠ No GEMINI_API_KEY`);
         return null;
     }
 
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+    const prompt = `You are a gender classification assistant for Instagram profiles.
 
-    for (let attempt = 0; attempt < 3; attempt++) {
+Profile info:
+- Username: ${username}
+- Display Name: ${displayName || '(not available)'}
+- Bio: ${bio || '(not available)'}
+
+Based on the name and username, determine the most likely gender.
+Consider international names (German, Spanish, French, Italian, Arabic, etc).
+
+Respond with EXACTLY one word:
+- "male" → clearly male name/person
+- "female" → clearly female name/person
+- "business" → company, brand, or organization
+- "unknown" → truly cannot determine (use as last resort)
+
+One word only. No explanation.`;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
         try {
             await waitForGeminiRateLimit();
-
-            const modelName = models[Math.min(attempt, models.length - 1)];
-            console.log(`  🤖 Gemini attempt ${attempt + 1}/3 (${modelName})`);
-
-            // Fetch image
-            const controller = new AbortController();
-            const tid = setTimeout(() => controller.abort(), 10000);
-            const imgRes = await fetch(imageUrl, { signal: controller.signal });
-            clearTimeout(tid);
-
-            if (!imgRes.ok) {
-                console.log(`  ⚠ Image fetch failed: ${imgRes.status}`);
-                return null;
-            }
-
-            const buf = await imgRes.arrayBuffer();
-            const b64 = Buffer.from(buf).toString('base64');
-            const mime = imgRes.headers.get('content-type') || 'image/jpeg';
-            console.log(`  📷 Image: ${Math.round(buf.byteLength / 1024)}KB`);
-
+            const modelName = attempt === 0 ? 'gemini-2.0-flash' : 'gemini-1.5-flash';
+            console.log(`  🤖 Gemini text attempt ${attempt + 1} (${modelName})`);
             const model = genAI.getGenerativeModel({ model: modelName });
-            const result = await model.generateContent([
-                { inlineData: { data: b64, mimeType: mime } },
-                { text: `Look at this Instagram profile picture. Based on visual appearance, determine the likely gender of the person in the photo.\n\nRules:\n- If you can see a person, respond with EXACTLY one of: "male", "female"\n- If the image is a logo, graphic, group photo, animal, object, or you cannot determine gender, respond with "unknown"\n- Respond with ONLY the single word: "male", "female", or "unknown"\n- Do not add any explanation or other text` }
-            ]);
-
+            const result = await model.generateContent(prompt);
             const response = result.response.text().trim().toLowerCase();
-            console.log(`  ✅ Gemini: "${response}"`);
+            console.log(`  ✅ Gemini text: "${response}"`);
 
-            if (response === 'male' || response === 'female') {
-                return { gender: response, confidence: 'Medium', reason: `AI profile image analysis → ${response}` };
-            }
-            return { gender: 'unknown', confidence: 'Low', reason: 'AI could not determine gender from profile image' };
-
+            if (response === 'male') return { gender: 'male', confidence: 'Medium', reason: `AI text analysis: ${username} → male` };
+            if (response === 'female') return { gender: 'female', confidence: 'Medium', reason: `AI text analysis: ${username} → female` };
+            if (response === 'business') return { gender: 'business', confidence: 'Medium', reason: `AI text analysis: ${username} → business/brand` };
+            return null;
         } catch (error: any) {
             const msg = error?.message || String(error);
             console.log(`  ❌ Gemini error: ${msg.slice(0, 100)}`);
-
-            if (msg.includes('429') || msg.includes('quota') || msg.includes('Resource')) {
-                const wait = (attempt + 1) * 8000;
-                console.log(`  ⏳ Rate limited, waiting ${wait / 1000}s...`);
-                await sleep(wait);
+            if (msg.includes('429') || msg.includes('quota')) {
+                await sleep(8000);
                 continue;
             }
             return null;
@@ -97,10 +91,23 @@ function extractDisplayName(title: string): string {
 }
 
 // Fallback: try to guess first name from the username itself
-// e.g. "erika.schweitzer" → "erika", "john_doe_1990" → "john"
-function extractFirstNameFromUsername(username: string): string {
-    const parts = username.toLowerCase().split(/[._\-0-9]+/).filter(p => p.length >= 2);
-    return parts[0] || '';
+// Goes longest-to-shortest so "erinbainbridge" finds "erin" before shorter wrong matches
+function getCandidateNamesFromUsername(username: string): string[] {
+    const lower = username.toLowerCase();
+    const candidates: string[] = [];
+
+    // 1. Split by separators (e.g. erika.schweitzer → ["erika", "schweitzer"])
+    const parts = lower.split(/[._\-0-9]+/).filter(p => p.length >= 2);
+    candidates.push(...parts);
+
+    // 2. If no separators or first part is the whole name, scan prefixes longest-first
+    const full = parts.length === 1 || parts[0] === lower ? lower : parts[0];
+    for (let len = Math.min(12, full.length); len >= 3; len--) {
+        const prefix = full.slice(0, len);
+        if (!candidates.includes(prefix)) candidates.push(prefix);
+    }
+
+    return candidates;
 }
 
 export async function POST(req: Request) {
@@ -179,37 +186,38 @@ export async function POST(req: Request) {
                 console.log(`  → Female (bio)`);
             }
 
-            // ── STEP 3: Local name database — try display name first, then username ──
+            // ── STEP 3: Local name database — try display name first, then username candidates ──
             if (category === 'N/A') {
-                // Try display name from page title
-                const namesToTry = [displayName, extractFirstNameFromUsername(username)].filter(Boolean);
+                const namesToTry = [
+                    displayName,
+                    ...getCandidateNamesFromUsername(username)
+                ].filter(Boolean);
+
                 for (const nameCandidate of namesToTry) {
-                    console.log(`  🔍 Checking local name DB for "${nameCandidate}"...`);
                     const nameResult = detectGenderFromName(nameCandidate!);
                     if (nameResult) {
                         category = nameResult.gender === 'male' ? 'Male' : 'Female';
                         confidence = nameResult.probability > 0.9 ? 'High' : 'Medium';
                         reason = `Name "${nameCandidate}" → ${nameResult.gender} (local DB, ${Math.round(nameResult.probability * 100)}%)`;
-                        console.log(`  → ${category} (name: "${nameCandidate}")`);
+                        console.log(`  → ${category} (name match: "${nameCandidate}")`);
                         break;
-                    } else {
-                        console.log(`  ✗ Name "${nameCandidate}" not in database`);
                     }
                 }
             }
 
-            // ── STEP 4: Gemini AI image analysis (only if still N/A) ──
-            if (category === 'N/A' && image && image.length > 10) {
-                console.log(`  📸 Trying AI vision analysis...`);
-                const visionResult = await detectGenderByImage(image, username);
-                if (visionResult && (visionResult.gender === 'male' || visionResult.gender === 'female')) {
-                    category = visionResult.gender === 'male' ? 'Male' : 'Female';
-                    confidence = visionResult.confidence;
-                    reason = visionResult.reason;
-                    console.log(`  → ${category} (AI vision)`);
-                } else {
-                    reason = visionResult?.reason || 'AI analysis failed';
-                    console.log(`  ✗ AI vision: ${reason}`);
+            // ── STEP 4: Gemini AI text classification (username + display name + bio) ──
+            if (category === 'N/A') {
+                console.log(`  🤖 Trying Gemini text classification...`);
+                const geminiResult = await classifyWithGeminiText(username, displayName, bio || '');
+                if (geminiResult) {
+                    if (geminiResult.gender === 'male') {
+                        category = 'Male'; confidence = geminiResult.confidence; reason = geminiResult.reason;
+                    } else if (geminiResult.gender === 'female') {
+                        category = 'Female'; confidence = geminiResult.confidence; reason = geminiResult.reason;
+                    } else if (geminiResult.gender === 'business') {
+                        category = 'Business Page'; confidence = geminiResult.confidence; reason = geminiResult.reason;
+                    }
+                    console.log(`  → ${category} (Gemini text)`);
                 }
             }
 
