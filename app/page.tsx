@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { CSVUploader } from "@/components/csv-uploader"
 import { ResultsTable, AnalysisResult } from "@/components/results-table"
 import { Button } from "@/components/ui/button"
@@ -15,6 +15,9 @@ export default function Home() {
 
     const [isPaused, setIsPaused] = useState(false)
     const [shouldStop, setShouldStop] = useState(false)
+    // Refs so the async loop always reads the live value (avoids stale closure)
+    const isPausedRef = useRef(false)
+    const shouldStopRef = useRef(false)
 
     // Gemini Daily Usage
     const [geminiUsage, setGeminiUsage] = useState(0)
@@ -149,10 +152,13 @@ export default function Home() {
     }
 
     const togglePause = () => {
-        setIsPaused(prev => !prev)
+        const next = !isPausedRef.current
+        isPausedRef.current = next
+        setIsPaused(next)
     }
 
     const stopAnalysis = () => {
+        shouldStopRef.current = true
         setShouldStop(true)
         setIsProcessing(false)
     }
@@ -162,13 +168,17 @@ export default function Home() {
         setIsProcessing(true)
         setShouldStop(false)
         setIsPaused(false)
+        // Reset refs so a fresh run starts clean
+        shouldStopRef.current = false
+        isPausedRef.current = false
         setProgress({ current: 0, total: data.length })
 
         for (let i = 0; i < data.length; i++) {
-            if (shouldStop) break;
+            // Use refs — they always reflect the latest value inside async loops
+            if (shouldStopRef.current) break;
 
-            while (isPaused) {
-                if (shouldStop) break;
+            while (isPausedRef.current) {
+                if (shouldStopRef.current) break;
                 await new Promise(resolve => setTimeout(resolve, 500));
             }
 
