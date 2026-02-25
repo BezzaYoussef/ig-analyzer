@@ -84,34 +84,22 @@ One word only. No explanation.`;
     return null;
 }
 
-// Use Gemini Vision to analyze the profile picture image
+
+// Use Gemini Vision to analyze a profile picture PNG buffer
+// Buffer comes from a Playwright element screenshot - no CDN auth issues
 async function classifyWithGeminiImage(
-    imageUrl: string
+    imageBuffer: Buffer | null
 ): Promise<{ gender: string; reason: string } | null> {
-    if (!GEMINI_API_KEY || !imageUrl || imageUrl.length < 10) return null;
+    if (!GEMINI_API_KEY || !imageBuffer || imageBuffer.length < 500) return null;
 
     try {
         await waitForGeminiRateLimit();
-        console.log(`  📸 Fetching profile image for Gemini vision...`);
-        const controller = new AbortController();
-        const tid = setTimeout(() => controller.abort(), 10000);
-        const imgRes = await fetch(imageUrl, { signal: controller.signal });
-        clearTimeout(tid);
+        console.log(`  📸 Sending ${Math.round(imageBuffer.length / 1024)}KB screenshot to Gemini vision...`);
 
-        if (!imgRes.ok) {
-            console.log(`  ⚠ Image fetch failed: ${imgRes.status}`);
-            return null;
-        }
-
-        const buf = await imgRes.arrayBuffer();
-        const b64 = Buffer.from(buf).toString('base64');
-        const mime = imgRes.headers.get('content-type') || 'image/jpeg';
-        console.log(`  📷 Image: ${Math.round(buf.byteLength / 1024)}KB`);
-
-        await waitForGeminiRateLimit();
+        const b64 = imageBuffer.toString('base64');
         const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
         const result = await model.generateContent([
-            { inlineData: { data: b64, mimeType: mime } },
+            { inlineData: { data: b64, mimeType: 'image/png' } },
             { text: `Look at this Instagram profile picture and determine the likely gender of the person shown.\nRules:\n- If a person is clearly visible: respond with "male" or "female"\n- If it's a logo, object, group, animal, or unclear: respond with "unknown"\nOne word only: "male", "female", or "unknown"` }
         ]);
 
@@ -122,7 +110,7 @@ async function classifyWithGeminiImage(
         if (response === 'female') return { gender: 'female', reason: 'AI profile image → female' };
         return null;
     } catch (error: any) {
-        console.log(`  ❌ Gemini image error: ${String(error).slice(0, 80)}`);
+        console.log(`  ❌ Gemini image error: ${String(error).slice(0, 100)}`);
         return null;
     }
 }
@@ -164,10 +152,14 @@ export async function POST(req: Request) {
         });
         const page = await context.newPage();
 
-        // Block images, fonts, and stylesheets — we only need og: meta tags
+        // Allow Instagram CDN images (for profile pictures) but block everything else
         await page.route('**/*', (route) => {
             const type = route.request().resourceType();
-            if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
+            const url = route.request().url();
+            // Let Instagram profile pictures through
+            if (type === 'image' && url.includes('cdninstagram.com')) {
+                route.continue();
+            } else if (['image', 'font', 'stylesheet', 'media'].includes(type)) {
                 route.abort();
             } else {
                 route.continue();
@@ -178,12 +170,23 @@ export async function POST(req: Request) {
             await page.goto(`https://www.instagram.com/${username}/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
             const bio = await page.locator('meta[property="og:description"]').getAttribute('content').catch(() => '');
-            const image = await page.locator('meta[property="og:image"]').getAttribute('content').catch(() => '');
             const title = await page.title();
+
+            // Screenshot the profile picture element — this is more reliable than fetching
+            // the og:image URL, which Instagram CDN blocks from server-side requests
+            let profileImageBuffer: Buffer | null = null;
+            try {
+                const avatarEl = page.locator('img[alt*="profile picture"]').first();
+                await avatarEl.waitFor({ state: 'visible', timeout: 5000 });
+                profileImageBuffer = await avatarEl.screenshot();
+                console.log(`  📸 Profile picture screenshot: ${Math.round(profileImageBuffer.length / 1024)}KB`);
+            } catch {
+                console.log(`  ⚠ No profile picture element found (likely login wall)`);
+            }
 
             console.log(`  Title: ${title?.slice(0, 80)}`);
             console.log(`  Bio: ${bio?.slice(0, 80) || '(none)'}`);
-            console.log(`  Image: ${image ? 'YES' : 'NO'}`);
+            console.log(`  ProfilePic: ${profileImageBuffer ? 'YES' : 'NO'}`);
 
             if (title.includes('Page Not Found')) {
                 await browser.close();
@@ -241,10 +244,10 @@ export async function POST(req: Request) {
                 }
             }
 
-            // ── STEP 4: Gemini IMAGE first (highest-priority AI signal) ──
+            // ── STEP 4: Gemini IMAGE (screenshot of profile picture, highest priority) ──
             if (category === 'N/A') {
                 console.log(`  📸 Running Gemini image analysis (priority 1)...`);
-                const imageResult = await classifyWithGeminiImage(image || '');
+                const imageResult = await classifyWithGeminiImage(profileImageBuffer);
                 if (imageResult) {
                     category = imageResult.gender === 'male' ? 'Male' : 'Female';
                     confidence = 'Medium';
