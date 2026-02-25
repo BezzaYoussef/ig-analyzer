@@ -8,6 +8,7 @@ import { detectGenderFromName } from '@/lib/gender-names';
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const DEEPFACE_URL = process.env.DEEPFACE_SERVICE_URL || '';
 
 // Rate limiter for Gemini API calls
 let lastGeminiCallTime = 0;
@@ -85,32 +86,45 @@ One word only. No explanation.`;
 }
 
 
-// Use Gemini Vision to analyze a profile picture PNG buffer
-// Buffer comes from a Playwright element screenshot - no CDN auth issues
-async function classifyWithGeminiImage(
+// Call the DeepFace Python microservice for gender detection from image
+// Accepts a PNG buffer from a Playwright element screenshot
+async function classifyWithDeepFace(
     imageBuffer: Buffer | null
-): Promise<{ gender: string; reason: string } | null> {
-    if (!GEMINI_API_KEY || !imageBuffer || imageBuffer.length < 500) return null;
+): Promise<{ gender: string; confidence: number; reason: string } | null> {
+    if (!DEEPFACE_URL || !imageBuffer || imageBuffer.length < 500) return null;
 
     try {
-        await waitForGeminiRateLimit();
-        console.log(`  📸 Sending ${Math.round(imageBuffer.length / 1024)}KB screenshot to Gemini vision...`);
-
         const b64 = imageBuffer.toString('base64');
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-        const result = await model.generateContent([
-            { inlineData: { data: b64, mimeType: 'image/png' } },
-            { text: `Look at this Instagram profile picture and determine the likely gender of the person shown.\nRules:\n- If a person is clearly visible: respond with "male" or "female"\n- If it's a logo, object, group, animal, or unclear: respond with "unknown"\nOne word only: "male", "female", or "unknown"` }
-        ]);
+        console.log(`  👤 Sending ${Math.round(imageBuffer.length / 1024)}KB to DeepFace service...`);
 
-        const response = result.response.text().trim().toLowerCase();
-        console.log(`  ✅ Gemini image: "${response}"`);
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 15000);
+        const res = await fetch(`${DEEPFACE_URL}/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image_b64: b64 }),
+            signal: controller.signal,
+        });
+        clearTimeout(tid);
 
-        if (response === 'male') return { gender: 'male', reason: 'AI profile image → male' };
-        if (response === 'female') return { gender: 'female', reason: 'AI profile image → female' };
-        return null;
+        if (!res.ok) {
+            console.log(`  ⚠ DeepFace service error: ${res.status}`);
+            return null;
+        }
+
+        const data = await res.json();
+        console.log(`  ✅ DeepFace: face_detected=${data.face_detected}, gender=${data.gender}, confidence=${data.confidence}`);
+
+        if (!data.face_detected || !data.gender) return null;
+
+        const gender = data.gender === 'Man' ? 'male' : 'female';
+        return {
+            gender,
+            confidence: data.confidence,
+            reason: `DeepFace → ${data.gender} (${data.confidence}%)`,
+        };
     } catch (error: any) {
-        console.log(`  ❌ Gemini image error: ${String(error).slice(0, 100)}`);
+        console.log(`  ❌ DeepFace error: ${String(error).slice(0, 100)}`);
         return null;
     }
 }
@@ -244,15 +258,15 @@ export async function POST(req: Request) {
                 }
             }
 
-            // ── STEP 4: Gemini IMAGE (screenshot of profile picture, highest priority) ──
+            // ── STEP 4: DeepFace — precise face gender detection (highest priority AI) ──
             if (category === 'N/A') {
-                console.log(`  📸 Running Gemini image analysis (priority 1)...`);
-                const imageResult = await classifyWithGeminiImage(profileImageBuffer);
-                if (imageResult) {
-                    category = imageResult.gender === 'male' ? 'Male' : 'Female';
-                    confidence = 'Medium';
-                    reason = imageResult.reason;
-                    console.log(`  → ${category} (image)`);
+                console.log(`  👤 Running DeepFace gender detection...`);
+                const dfResult = await classifyWithDeepFace(profileImageBuffer);
+                if (dfResult) {
+                    category = dfResult.gender === 'male' ? 'Male' : 'Female';
+                    confidence = dfResult.confidence >= 90 ? 'High' : 'Medium';
+                    reason = dfResult.reason;
+                    console.log(`  → ${category} (DeepFace)`);
                 }
             }
 
