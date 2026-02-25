@@ -84,6 +84,49 @@ One word only. No explanation.`;
     return null;
 }
 
+// Use Gemini Vision to analyze the profile picture image
+async function classifyWithGeminiImage(
+    imageUrl: string
+): Promise<{ gender: string; reason: string } | null> {
+    if (!GEMINI_API_KEY || !imageUrl || imageUrl.length < 10) return null;
+
+    try {
+        await waitForGeminiRateLimit();
+        console.log(`  📸 Fetching profile image for Gemini vision...`);
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 10000);
+        const imgRes = await fetch(imageUrl, { signal: controller.signal });
+        clearTimeout(tid);
+
+        if (!imgRes.ok) {
+            console.log(`  ⚠ Image fetch failed: ${imgRes.status}`);
+            return null;
+        }
+
+        const buf = await imgRes.arrayBuffer();
+        const b64 = Buffer.from(buf).toString('base64');
+        const mime = imgRes.headers.get('content-type') || 'image/jpeg';
+        console.log(`  📷 Image: ${Math.round(buf.byteLength / 1024)}KB`);
+
+        await waitForGeminiRateLimit();
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+        const result = await model.generateContent([
+            { inlineData: { data: b64, mimeType: mime } },
+            { text: `Look at this Instagram profile picture and determine the likely gender of the person shown.\nRules:\n- If a person is clearly visible: respond with "male" or "female"\n- If it's a logo, object, group, animal, or unclear: respond with "unknown"\nOne word only: "male", "female", or "unknown"` }
+        ]);
+
+        const response = result.response.text().trim().toLowerCase();
+        console.log(`  ✅ Gemini image: "${response}"`);
+
+        if (response === 'male') return { gender: 'male', reason: 'AI profile image → male' };
+        if (response === 'female') return { gender: 'female', reason: 'AI profile image → female' };
+        return null;
+    } catch (error: any) {
+        console.log(`  ❌ Gemini image error: ${String(error).slice(0, 80)}`);
+        return null;
+    }
+}
+
 // Extract display name from Instagram page title (format: "Name (@username) • Instagram")
 function extractDisplayName(title: string): string {
     const match = title.match(/^(.+?)\s*\(@/);
@@ -205,19 +248,43 @@ export async function POST(req: Request) {
                 }
             }
 
-            // ── STEP 4: Gemini AI text classification (username + display name + bio) ──
+            // ── STEP 4: Combined Gemini AI — text + image analysis ──
             if (category === 'N/A') {
-                console.log(`  🤖 Trying Gemini text classification...`);
-                const geminiResult = await classifyWithGeminiText(username, displayName, bio || '');
-                if (geminiResult) {
-                    if (geminiResult.gender === 'male') {
-                        category = 'Male'; confidence = geminiResult.confidence; reason = geminiResult.reason;
-                    } else if (geminiResult.gender === 'female') {
-                        category = 'Female'; confidence = geminiResult.confidence; reason = geminiResult.reason;
-                    } else if (geminiResult.gender === 'business') {
-                        category = 'Business Page'; confidence = geminiResult.confidence; reason = geminiResult.reason;
-                    }
-                    console.log(`  → ${category} (Gemini text)`);
+                console.log(`  🤖 Running Gemini text + image analysis...`);
+
+                // 4a: Text classification (always runs)
+                const textResult = await classifyWithGeminiText(username, displayName, bio || '');
+
+                // 4b: Image classification (runs in parallel intent, but sequentially due to rate limit)
+                const imageResult = await classifyWithGeminiImage(image || '');
+
+                const textGender = textResult?.gender;
+                const imgGender = imageResult?.gender;
+
+                // Combine results
+                if (textGender && imgGender && textGender === imgGender) {
+                    // Both agree → High confidence
+                    category = textGender === 'male' ? 'Male' : textGender === 'female' ? 'Female' : 'Business Page';
+                    confidence = 'High';
+                    reason = `${textResult!.reason} + ${imageResult!.reason}`;
+                    console.log(`  → ${category} (text + image AGREE → High)`);
+                } else if (textGender && textGender !== 'business') {
+                    // Text only
+                    category = textGender === 'male' ? 'Male' : 'Female';
+                    confidence = 'Medium';
+                    reason = textResult!.reason + (imgGender ? ` (image: ${imgGender})` : ' (no image result)');
+                    console.log(`  → ${category} (text only)`);
+                } else if (imgGender) {
+                    // Image only
+                    category = imgGender === 'male' ? 'Male' : 'Female';
+                    confidence = 'Medium';
+                    reason = imageResult!.reason;
+                    console.log(`  → ${category} (image only)`);
+                } else if (textResult?.gender === 'business') {
+                    category = 'Business Page';
+                    confidence = 'Medium';
+                    reason = textResult.reason;
+                    console.log(`  → Business Page (text)`);
                 }
             }
 
